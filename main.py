@@ -65,18 +65,22 @@ async def init_db():
         """)
         await db.commit()
 
-        # Миграция для старых баз — добавляем колонку bank если нет
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN bank REAL DEFAULT 0")
-            await db.commit()
-        except Exception:
-            pass
+        # Миграция для старых баз
+        for migration in [
+            "ALTER TABLE users ADD COLUMN bank REAL DEFAULT 0",
+        ]:
+            try:
+                await db.execute(migration)
+                await db.commit()
+            except Exception:
+                pass
+
+        # Удаляем колонку registered если осталась (SQLite не поддерживает DROP COLUMN до 3.35, просто игнорим)
 
     logger.info("✅ Database initialized")
 
 
 async def log_transaction(db, type_: str, from_user, to_user, amount: float):
-    """Записывает транзакцию в БД и в лог."""
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     await db.execute(
         "INSERT INTO transactions (type, from_user, to_user, amount, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -88,13 +92,8 @@ async def log_transaction(db, type_: str, from_user, to_user, amount: float):
 # =========================
 # UTILS
 # =========================
-async def save_user(message: Message):
-    if not message or not message.from_user:
-        return
-
-    uid = message.from_user.id
-    username = message.from_user.username
-
+async def ensure_user(uid: int, username: str = None):
+    """Создаёт пользователя в БД если его нет. Регистрация не нужна."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,)
@@ -105,6 +104,12 @@ async def save_user(message: Message):
                 (username.lower(), uid)
             )
         await db.commit()
+
+
+async def save_user(message: Message):
+    if not message or not message.from_user:
+        return
+    await ensure_user(message.from_user.id, message.from_user.username)
 
 
 async def get_user_id(identifier: str):
@@ -122,15 +127,6 @@ async def get_user_id(identifier: str):
     return row[0] if row else None
 
 
-async def user_exists(user_id: int) -> bool:
-    """Проверяет, существует ли пользователь в базе."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT 1 FROM users WHERE user_id = ?", (user_id,)
-        ) as cur:
-            return await cur.fetchone() is not None
-
-
 # =========================
 # BOT
 # =========================
@@ -143,7 +139,7 @@ async def start(message: Message):
     logger.info(f"👋 /start — user={message.from_user.id}")
     await message.answer(
         "👋 <b>Добро пожаловать!</b>\n\n"
-        "🤖 Бот запущен и готов к работе.\n"
+        "🤖 Бот готов к работе.\n"
         "📖 Используй /help чтобы увидеть все команды."
     )
 
@@ -151,12 +147,13 @@ async def start(message: Message):
 @dp.message(Command("profile"))
 async def profile(message: Message):
     await save_user(message)
-    logger.info(f"👤 /profile — user={message.from_user.id}")
+    uid = message.from_user.id
+    logger.info(f"👤 /profile — user={uid}")
 
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT nickname, balance, bank FROM users WHERE user_id = ?",
-            (message.from_user.id,)
+            (uid,)
         ) as cur:
             row = await cur.fetchone()
 
@@ -175,6 +172,7 @@ async def profile(message: Message):
 @dp.message(Command("nick"))
 async def nick(message: Message):
     await save_user(message)
+    uid = message.from_user.id
 
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
@@ -190,11 +188,11 @@ async def nick(message: Message):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE users SET nickname = ? WHERE user_id = ?",
-            (new_nick, message.from_user.id)
+            (new_nick, uid)
         )
         await db.commit()
 
-    logger.info(f"✏️ /nick — user={message.from_user.id} new_nick={new_nick}")
+    logger.info(f"✏️ /nick — user={uid} new_nick={new_nick}")
     await message.answer(f"✅ Никнейм обновлён: <b>{new_nick}</b>")
 
 
@@ -209,13 +207,11 @@ async def add(message: Message):
     parts = message.text.split()
     reply = message.reply_to_message
 
-    # Режим реплая: /add 100 (ответ на сообщение игрока)
     if reply and reply.from_user:
         if len(parts) < 2:
             return await message.answer("⚠️ Использование (реплай): /add 100")
         target = reply.from_user.id
         amount_str = parts[1]
-    # Обычный режим: /add @user 100
     else:
         if len(parts) < 3:
             return await message.answer("⚠️ Использование: /add @user 100\nИли ответь на сообщение игрока: /add 100")
@@ -224,8 +220,8 @@ async def add(message: Message):
             return await message.answer("❌ Пользователь не найден")
         amount_str = parts[2]
 
-    if not await user_exists(target):
-        return await message.answer("❌ Пользователь не зарегистрирован в боте")
+    # Автоматически создаём пользователя если нет
+    await ensure_user(target)
 
     try:
         amount = float(amount_str)
@@ -257,13 +253,11 @@ async def take(message: Message):
     parts = message.text.split()
     reply = message.reply_to_message
 
-    # Режим реплая: /take 100
     if reply and reply.from_user:
         if len(parts) < 2:
             return await message.answer("⚠️ Использование (реплай): /take 100")
         target = reply.from_user.id
         amount_str = parts[1]
-    # Обычный режим: /take @user 100
     else:
         if len(parts) < 3:
             return await message.answer("⚠️ Использование: /take @user 100\nИли ответь на сообщение игрока: /take 100")
@@ -272,8 +266,7 @@ async def take(message: Message):
             return await message.answer("❌ Пользователь не найден")
         amount_str = parts[2]
 
-    if not await user_exists(target):
-        return await message.answer("❌ Пользователь не зарегистрирован в боте")
+    await ensure_user(target)
 
     try:
         amount = float(amount_str)
@@ -307,6 +300,7 @@ async def take(message: Message):
 @dp.message(Command("withdraw"))
 async def withdraw(message: Message):
     await save_user(message)
+    uid = message.from_user.id
 
     parts = message.text.split()
     if len(parts) < 2:
@@ -319,8 +313,6 @@ async def withdraw(message: Message):
 
     if amount <= 0:
         return await message.answer("⚠️ Сумма должна быть > 0")
-
-    uid = message.from_user.id
 
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
@@ -342,17 +334,15 @@ async def withdraw(message: Message):
 
     await message.answer(f"💸 Вывод выполнен: <b>-{amount:.2f}$</b>")
 
-    # Уведомляем всех администраторов о запросе на вывод
-    bot: Bot = dp["bot"] if "bot" in dp else None
-    # Уведомление отправляется отдельно после коммита, ошибка не должна откатить транзакцию
+    bot: Bot = dp.get("bot")
     try:
-        nick = message.from_user.username or str(uid)
+        nick_str = message.from_user.username or str(uid)
         for admin_id in ADMINS:
             if bot:
                 await bot.send_message(
                     admin_id,
                     f"🏧 <b>Запрос на вывод</b>\n"
-                    f"👤 Пользователь: @{nick} (<code>{uid}</code>)\n"
+                    f"👤 Пользователь: @{nick_str} (<code>{uid}</code>)\n"
                     f"💵 Сумма: <b>{amount:.2f}$</b>"
                 )
     except Exception as e:
@@ -362,17 +352,16 @@ async def withdraw(message: Message):
 @dp.message(Command("pay"))
 async def pay(message: Message):
     await save_user(message)
+    sender = message.from_user.id
 
     parts = message.text.split()
     reply = message.reply_to_message
 
-    # Режим реплая: /pay 100
     if reply and reply.from_user:
         if len(parts) < 2:
             return await message.answer("⚠️ Использование (реплай): /pay 100")
         target = reply.from_user.id
         amount_str = parts[1]
-    # Обычный режим: /pay @user 100
     else:
         if len(parts) < 3:
             return await message.answer("⚠️ Использование: /pay @user 100\nИли ответь на сообщение игрока: /pay 100")
@@ -381,8 +370,7 @@ async def pay(message: Message):
             return await message.answer("❌ Пользователь не найден")
         amount_str = parts[2]
 
-    if not await user_exists(target):
-        return await message.answer("❌ Получатель не зарегистрирован в боте")
+    await ensure_user(target)
 
     try:
         amount = float(amount_str)
@@ -391,8 +379,6 @@ async def pay(message: Message):
 
     if amount <= 0:
         return await message.answer("⚠️ Сумма должна быть > 0")
-
-    sender = message.from_user.id
 
     if sender == target:
         return await message.answer("⚠️ Нельзя переводить самому себе")
@@ -466,7 +452,6 @@ async def history(message: Message):
         return
 
     if message.chat.type != "private":
-        logger.warning(f"🚫 /history — attempted in group by user={uid}")
         return await message.answer("🔒 Эта команда доступна только в личке с ботом")
 
     parts = message.text.split()
@@ -480,9 +465,7 @@ async def history(message: Message):
     logger.info(f"📋 /history — admin={uid} page={page}")
 
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT COUNT(*) FROM transactions"
-        ) as cur:
+        async with db.execute("SELECT COUNT(*) FROM transactions") as cur:
             total = (await cur.fetchone())[0]
 
         async with db.execute("""
@@ -499,10 +482,8 @@ async def history(message: Message):
     total_pages = (total + limit - 1) // limit
 
     icons = {
-        "PAY": "💸",
-        "ADD": "➕",
-        "TAKE": "➖",
-        "WITHDRAW": "🏧",
+        "PAY": "💸", "ADD": "➕", "TAKE": "➖",
+        "WITHDRAW": "🏧", "DEPOSIT": "🏦", "BANKWITHDRAW": "🏦",
     }
 
     text = f"📋 <b>Транзакции — страница {page}/{total_pages}</b>\n\n"
@@ -512,8 +493,8 @@ async def history(message: Message):
         to_str = f"→ <code>{to_u}</code>" if to_u else ""
         text += f"{icon} <b>{type_}</b> | <code>{from_u}</code> {to_str} | <b>{amount:.2f}$</b> | {created_at}\n"
 
-    if total_pages > 1:
-        text += f"\n📌 Следующая страница: /history {page + 1}" if page < total_pages else ""
+    if total_pages > 1 and page < total_pages:
+        text += f"\n📌 Следующая страница: /history {page + 1}"
 
     await message.answer(text)
 
@@ -521,6 +502,7 @@ async def history(message: Message):
 @dp.message(Command("deposit"))
 async def deposit(message: Message):
     await save_user(message)
+    uid = message.from_user.id
 
     parts = message.text.split()
     if len(parts) < 2:
@@ -533,8 +515,6 @@ async def deposit(message: Message):
 
     if amount <= 0:
         return await message.answer("⚠️ Сумма должна быть > 0")
-
-    uid = message.from_user.id
 
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
@@ -561,6 +541,7 @@ async def deposit(message: Message):
 @dp.message(Command("bankwithdraw"))
 async def bankwithdraw(message: Message):
     await save_user(message)
+    uid = message.from_user.id
 
     parts = message.text.split()
     if len(parts) < 2:
@@ -573,8 +554,6 @@ async def bankwithdraw(message: Message):
 
     if amount <= 0:
         return await message.answer("⚠️ Сумма должна быть > 0")
-
-    uid = message.from_user.id
 
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
@@ -640,8 +619,7 @@ async def checkprofile(message: Message):
         if target is None:
             return await message.answer("❌ Пользователь не найден")
 
-    if not await user_exists(target):
-        return await message.answer("❌ Пользователь не зарегистрирован в боте")
+    await ensure_user(target)
 
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
@@ -693,16 +671,13 @@ async def reset_all_balances(message: Message):
     uid = message.from_user.id
 
     if uid not in ADMINS:
-        # Молча игнорируем — не раскрываем существование команды
         return
 
-    # Только в личке
     if message.chat.type != "private":
         return
 
     parts = message.text.split()
 
-    # Требуем явное подтверждение: /resetallbalances_x7k2m CONFIRM
     if len(parts) < 2 or parts[1] != "CONFIRM":
         return await message.answer(
             "⚠️ Для подтверждения сброса ВСЕХ балансов введи:\n"
