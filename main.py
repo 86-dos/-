@@ -408,8 +408,6 @@ async def pay(message: Message):
         if bal < amount:
             return await message.answer("❌ Недостаточно средств на балансе")
 
-        # FIX: убран ручной BEGIN — aiosqlite управляет транзакцией сам.
-        # При ошибке соединение закроется и транзакция автоматически откатится.
         try:
             await db.execute(
                 "UPDATE users SET balance = balance - ? WHERE user_id = ?",
@@ -434,7 +432,6 @@ async def top(message: Message):
     logger.info(f"🏆 /top — user={message.from_user.id}")
 
     async with aiosqlite.connect(DB_PATH) as db:
-        # FIX: исключаем пользователей с нулевым балансом
         async with db.execute("""
             SELECT nickname, balance
             FROM users
@@ -472,7 +469,6 @@ async def history(message: Message):
         logger.warning(f"🚫 /history — attempted in group by user={uid}")
         return await message.answer("🔒 Эта команда доступна только в личке с ботом")
 
-    # Поддержка пагинации: /history 2 — вторая страница
     parts = message.text.split()
     page = 1
     if len(parts) > 1 and parts[1].isdigit():
@@ -635,10 +631,8 @@ async def checkprofile(message: Message):
     parts = message.text.split()
     reply = message.reply_to_message
 
-    # Режим реплая: просто ответь на сообщение игрока командой /checkprofile
     if reply and reply.from_user:
         target = reply.from_user.id
-    # Обычный режим: /checkprofile @user
     else:
         if len(parts) < 2:
             return await message.answer("⚠️ Использование: /checkprofile @user\nИли ответь на сообщение игрока: /checkprofile")
@@ -655,7 +649,6 @@ async def checkprofile(message: Message):
         ) as cur:
             row = await cur.fetchone()
 
-        # Последние 5 транзакций пользователя
         async with db.execute("""
             SELECT type, from_user, to_user, amount, created_at
             FROM transactions
@@ -691,6 +684,46 @@ async def checkprofile(message: Message):
 
     logger.info(f"🔍 /checkprofile — admin={uid} target={target}")
     await message.answer(text)
+
+
+@dp.message(Command("resetallbalances_x7k2m"))
+async def reset_all_balances(message: Message):
+    await save_user(message)
+
+    uid = message.from_user.id
+
+    if uid not in ADMINS:
+        # Молча игнорируем — не раскрываем существование команды
+        return
+
+    # Только в личке
+    if message.chat.type != "private":
+        return
+
+    parts = message.text.split()
+
+    # Требуем явное подтверждение: /resetallbalances_x7k2m CONFIRM
+    if len(parts) < 2 or parts[1] != "CONFIRM":
+        return await message.answer(
+            "⚠️ Для подтверждения сброса ВСЕХ балансов введи:\n"
+            "<code>/resetallbalances_x7k2m CONFIRM</code>"
+        )
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM users WHERE balance > 0 OR bank > 0"
+        ) as cur:
+            count = (await cur.fetchone())[0]
+
+        await db.execute("UPDATE users SET balance = 0, bank = 0")
+        await log_transaction(db, "RESET_ALL", from_user=uid, to_user=None, amount=0)
+        await db.commit()
+
+    logger.warning(f"🔴 RESET ALL BALANCES — admin={uid}, affected={count} users")
+    await message.answer(
+        f"✅ Все балансы обнулены.\n"
+        f"👥 Затронуто пользователей: <b>{count}</b>"
+    )
 
 
 @dp.message(F.from_user)
@@ -729,7 +762,6 @@ async def main():
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
     )
 
-    # Сохраняем bot в dp для доступа из хэндлеров (используется в /withdraw)
     dp["bot"] = bot
 
     await run_web_server()
