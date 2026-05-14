@@ -22,7 +22,7 @@ API_TOKEN = os.getenv("BOT_TOKEN")
 if not API_TOKEN:
     raise ValueError("❌ BOT_TOKEN not found in Secrets")
 
-ADMINS = {6814524171, 7764122495}
+ADMINS = {6814524171, 7764122495, 8010864043, 8246405204}
 
 DB_PATH = "economy.db"
 
