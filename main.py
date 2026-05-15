@@ -4,7 +4,7 @@ import sys
 import os
 from datetime import datetime
 
-import aiosqlite
+import asyncpg
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
@@ -18,13 +18,14 @@ from aiogram.exceptions import TelegramNetworkError
 # CONFIG
 # =========================
 API_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not API_TOKEN:
     raise ValueError("❌ BOT_TOKEN not found in Secrets")
+if not DATABASE_URL:
+    raise ValueError("❌ DATABASE_URL not found in Secrets")
 
 ADMINS = {6814524171, 7764122495, 8010864043, 8246405204}
-
-DB_PATH = "economy.db"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,56 +36,49 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # =========================
-# DB INIT
+# DB POOL
 # =========================
+pool: asyncpg.Pool = None
+
+
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
+    global pool
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+
+    async with pool.acquire() as conn:
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
+                user_id BIGINT PRIMARY KEY,
                 nickname TEXT,
-                balance REAL DEFAULT 0,
-                bank REAL DEFAULT 0
+                balance FLOAT DEFAULT 0,
+                bank FLOAT DEFAULT 0
             )
         """)
-        await db.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS usernames (
                 username TEXT PRIMARY KEY,
-                user_id INTEGER
+                user_id BIGINT
             )
         """)
-        await db.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 type TEXT NOT NULL,
-                from_user INTEGER,
-                to_user INTEGER,
-                amount REAL NOT NULL,
+                from_user BIGINT,
+                to_user BIGINT,
+                amount FLOAT NOT NULL,
                 created_at TEXT NOT NULL
             )
         """)
-        await db.commit()
-
-        # Миграция для старых баз
-        for migration in [
-            "ALTER TABLE users ADD COLUMN bank REAL DEFAULT 0",
-        ]:
-            try:
-                await db.execute(migration)
-                await db.commit()
-            except Exception:
-                pass
-
-        # Удаляем колонку registered если осталась (SQLite не поддерживает DROP COLUMN до 3.35, просто игнорим)
 
     logger.info("✅ Database initialized")
 
 
-async def log_transaction(db, type_: str, from_user, to_user, amount: float):
+async def log_transaction(conn, type_: str, from_user, to_user, amount: float):
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    await db.execute(
-        "INSERT INTO transactions (type, from_user, to_user, amount, created_at) VALUES (?, ?, ?, ?, ?)",
-        (type_, from_user, to_user, amount, now)
+    await conn.execute(
+        "INSERT INTO transactions (type, from_user, to_user, amount, created_at) VALUES ($1, $2, $3, $4, $5)",
+        type_, from_user, to_user, amount, now
     )
     logger.info(f"💾 [{type_}] from={from_user} to={to_user} amount={amount:.2f}$ at={now}")
 
@@ -93,17 +87,15 @@ async def log_transaction(db, type_: str, from_user, to_user, amount: float):
 # UTILS
 # =========================
 async def ensure_user(uid: int, username: str = None):
-    """Создаёт пользователя в БД если его нет. Регистрация не нужна."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", uid
         )
         if username:
-            await db.execute(
-                "INSERT OR REPLACE INTO usernames (username, user_id) VALUES (?, ?)",
-                (username.lower(), uid)
+            await conn.execute(
+                "INSERT INTO usernames (username, user_id) VALUES ($1, $2) ON CONFLICT (username) DO UPDATE SET user_id = $2",
+                username.lower(), uid
             )
-        await db.commit()
 
 
 async def save_user(message: Message):
@@ -118,13 +110,12 @@ async def get_user_id(identifier: str):
 
     clean = identifier.lower().replace("@", "")
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT user_id FROM usernames WHERE username = ?", (clean,)
-        ) as cur:
-            row = await cur.fetchone()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT user_id FROM usernames WHERE username = $1", clean
+        )
 
-    return row[0] if row else None
+    return row["user_id"] if row else None
 
 
 # =========================
@@ -150,16 +141,14 @@ async def profile(message: Message):
     uid = message.from_user.id
     logger.info(f"👤 /profile — user={uid}")
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT nickname, balance, bank FROM users WHERE user_id = ?",
-            (uid,)
-        ) as cur:
-            row = await cur.fetchone()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT nickname, balance, bank FROM users WHERE user_id = $1", uid
+        )
 
-    nick = row[0] if row and row[0] else "No name"
-    bal = row[1] if row else 0
-    bank = row[2] if row else 0
+    nick = row["nickname"] if row and row["nickname"] else "No name"
+    bal = row["balance"] if row else 0
+    bank = row["bank"] if row else 0
 
     await message.answer(
         f"👤 <b>Профиль</b>\n\n"
@@ -185,12 +174,10 @@ async def nick(message: Message):
     if len(new_nick) > 32:
         return await message.answer("⚠️ Никнейм слишком длинный (макс. 32 символа)")
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET nickname = ? WHERE user_id = ?",
-            (new_nick, uid)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET nickname = $1 WHERE user_id = $2", new_nick, uid
         )
-        await db.commit()
 
     logger.info(f"✏️ /nick — user={uid} new_nick={new_nick}")
     await message.answer(f"✅ Никнейм обновлён: <b>{new_nick}</b>")
@@ -220,7 +207,6 @@ async def add(message: Message):
             return await message.answer("❌ Пользователь не найден")
         amount_str = parts[2]
 
-    # Автоматически создаём пользователя если нет
     await ensure_user(target)
 
     try:
@@ -231,13 +217,11 @@ async def add(message: Message):
     if amount <= 0:
         return await message.answer("⚠️ Сумма должна быть > 0")
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET balance = balance + ? WHERE user_id = ?",
-            (amount, target)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET balance = balance + $1 WHERE user_id = $2", amount, target
         )
-        await log_transaction(db, "ADD", from_user=message.from_user.id, to_user=target, amount=amount)
-        await db.commit()
+        await log_transaction(conn, "ADD", from_user=message.from_user.id, to_user=target, amount=amount)
 
     await message.answer(f"✅ Начислено <b>+{amount:.2f}$</b> пользователю <code>{target}</code>")
 
@@ -276,23 +260,17 @@ async def take(message: Message):
     if amount <= 0:
         return await message.answer("⚠️ Сумма должна быть > 0")
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT balance FROM users WHERE user_id = ?", (target,)
-        ) as cur:
-            row = await cur.fetchone()
-
-        bal = row[0] if row else 0
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT balance FROM users WHERE user_id = $1", target)
+        bal = row["balance"] if row else 0
 
         if bal < amount:
             return await message.answer("❌ У пользователя недостаточно средств")
 
-        await db.execute(
-            "UPDATE users SET balance = balance - ? WHERE user_id = ?",
-            (amount, target)
+        await conn.execute(
+            "UPDATE users SET balance = balance - $1 WHERE user_id = $2", amount, target
         )
-        await log_transaction(db, "TAKE", from_user=target, to_user=None, amount=amount)
-        await db.commit()
+        await log_transaction(conn, "TAKE", from_user=target, to_user=None, amount=amount)
 
     await message.answer(f"✅ Снято <b>-{amount:.2f}$</b> у пользователя <code>{target}</code>")
 
@@ -314,23 +292,17 @@ async def withdraw(message: Message):
     if amount <= 0:
         return await message.answer("⚠️ Сумма должна быть > 0")
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT balance FROM users WHERE user_id = ?", (uid,)
-        ) as cur:
-            row = await cur.fetchone()
-
-        bal = row[0] if row else 0
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT balance FROM users WHERE user_id = $1", uid)
+        bal = row["balance"] if row else 0
 
         if bal < amount:
             return await message.answer("❌ Недостаточно средств на балансе")
 
-        await db.execute(
-            "UPDATE users SET balance = balance - ? WHERE user_id = ?",
-            (amount, uid)
+        await conn.execute(
+            "UPDATE users SET balance = balance - $1 WHERE user_id = $2", amount, uid
         )
-        await log_transaction(db, "WITHDRAW", from_user=uid, to_user=None, amount=amount)
-        await db.commit()
+        await log_transaction(conn, "WITHDRAW", from_user=uid, to_user=None, amount=amount)
 
     await message.answer(f"💸 Вывод выполнен: <b>-{amount:.2f}$</b>")
 
@@ -383,28 +355,22 @@ async def pay(message: Message):
     if sender == target:
         return await message.answer("⚠️ Нельзя переводить самому себе")
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT balance FROM users WHERE user_id = ?", (sender,)
-        ) as cur:
-            row = await cur.fetchone()
-
-        bal = row[0] if row else 0
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT balance FROM users WHERE user_id = $1", sender)
+        bal = row["balance"] if row else 0
 
         if bal < amount:
             return await message.answer("❌ Недостаточно средств на балансе")
 
         try:
-            await db.execute(
-                "UPDATE users SET balance = balance - ? WHERE user_id = ?",
-                (amount, sender)
-            )
-            await db.execute(
-                "UPDATE users SET balance = balance + ? WHERE user_id = ?",
-                (amount, target)
-            )
-            await log_transaction(db, "PAY", from_user=sender, to_user=target, amount=amount)
-            await db.commit()
+            async with conn.transaction():
+                await conn.execute(
+                    "UPDATE users SET balance = balance - $1 WHERE user_id = $2", amount, sender
+                )
+                await conn.execute(
+                    "UPDATE users SET balance = balance + $1 WHERE user_id = $2", amount, target
+                )
+                await log_transaction(conn, "PAY", from_user=sender, to_user=target, amount=amount)
         except Exception as e:
             logger.error(f"❌ [PAY] Transaction failed: {e}")
             return await message.answer("❌ Ошибка транзакции, попробуй ещё раз")
@@ -417,15 +383,14 @@ async def top(message: Message):
     await save_user(message)
     logger.info(f"🏆 /top — user={message.from_user.id}")
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
             SELECT nickname, balance
             FROM users
             WHERE balance > 0
             ORDER BY balance DESC
             LIMIT 10
-        """) as cur:
-            rows = await cur.fetchall()
+        """)
 
     if not rows:
         return await message.answer("❌ Список пуст")
@@ -434,8 +399,8 @@ async def top(message: Message):
     text = "🏆 <b>ТОП ИГРОКОВ</b>\n\n"
 
     for i, r in enumerate(rows, 1):
-        nick = r[0] or "No name"
-        bal = r[1]
+        nick = r["nickname"] or "No name"
+        bal = r["balance"]
         medal = medals[i - 1] if i <= 3 else f"{i}."
         text += f"{medal} {nick} — <b>{bal:.2f}$</b>\n"
 
@@ -464,17 +429,14 @@ async def history(message: Message):
 
     logger.info(f"📋 /history — admin={uid} page={page}")
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT COUNT(*) FROM transactions") as cur:
-            total = (await cur.fetchone())[0]
-
-        async with db.execute("""
+    async with pool.acquire() as conn:
+        total = await conn.fetchval("SELECT COUNT(*) FROM transactions")
+        rows = await conn.fetch("""
             SELECT type, from_user, to_user, amount, created_at
             FROM transactions
             ORDER BY id DESC
-            LIMIT ? OFFSET ?
-        """, (limit, offset)) as cur:
-            rows = await cur.fetchall()
+            LIMIT $1 OFFSET $2
+        """, limit, offset)
 
     if not rows:
         return await message.answer("📭 История транзакций пуста")
@@ -488,7 +450,11 @@ async def history(message: Message):
 
     text = f"📋 <b>Транзакции — страница {page}/{total_pages}</b>\n\n"
     for r in rows:
-        type_, from_u, to_u, amount, created_at = r
+        type_ = r["type"]
+        from_u = r["from_user"]
+        to_u = r["to_user"]
+        amount = r["amount"]
+        created_at = r["created_at"]
         icon = icons.get(type_, "🔄")
         to_str = f"→ <code>{to_u}</code>" if to_u else ""
         text += f"{icon} <b>{type_}</b> | <code>{from_u}</code> {to_str} | <b>{amount:.2f}$</b> | {created_at}\n"
@@ -516,23 +482,18 @@ async def deposit(message: Message):
     if amount <= 0:
         return await message.answer("⚠️ Сумма должна быть > 0")
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT balance FROM users WHERE user_id = ?", (uid,)
-        ) as cur:
-            row = await cur.fetchone()
-
-        bal = row[0] if row else 0
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT balance FROM users WHERE user_id = $1", uid)
+        bal = row["balance"] if row else 0
 
         if bal < amount:
             return await message.answer("❌ Недостаточно средств на балансе")
 
-        await db.execute(
-            "UPDATE users SET balance = balance - ?, bank = bank + ? WHERE user_id = ?",
-            (amount, amount, uid)
+        await conn.execute(
+            "UPDATE users SET balance = balance - $1, bank = bank + $1 WHERE user_id = $2",
+            amount, uid
         )
-        await log_transaction(db, "DEPOSIT", from_user=uid, to_user=None, amount=amount)
-        await db.commit()
+        await log_transaction(conn, "DEPOSIT", from_user=uid, to_user=None, amount=amount)
 
     logger.info(f"🏦 /deposit — user={uid} amount={amount}")
     await message.answer(f"🏦 Положено в банк: <b>+{amount:.2f}$</b>")
@@ -555,23 +516,18 @@ async def bankwithdraw(message: Message):
     if amount <= 0:
         return await message.answer("⚠️ Сумма должна быть > 0")
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT bank FROM users WHERE user_id = ?", (uid,)
-        ) as cur:
-            row = await cur.fetchone()
-
-        bank = row[0] if row else 0
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT bank FROM users WHERE user_id = $1", uid)
+        bank = row["bank"] if row else 0
 
         if bank < amount:
             return await message.answer("❌ Недостаточно средств в банке")
 
-        await db.execute(
-            "UPDATE users SET bank = bank - ?, balance = balance + ? WHERE user_id = ?",
-            (amount, amount, uid)
+        await conn.execute(
+            "UPDATE users SET bank = bank - $1, balance = balance + $1 WHERE user_id = $2",
+            amount, uid
         )
-        await log_transaction(db, "BANKWITHDRAW", from_user=uid, to_user=None, amount=amount)
-        await db.commit()
+        await log_transaction(conn, "BANKWITHDRAW", from_user=uid, to_user=None, amount=amount)
 
     logger.info(f"🏦 /bankwithdraw — user={uid} amount={amount}")
     await message.answer(f"💰 Снято из банка: <b>+{amount:.2f}$</b>")
@@ -600,7 +556,6 @@ async def help_cmd(message: Message):
 @dp.message(Command("checkprofile"))
 async def checkprofile(message: Message):
     await save_user(message)
-
     uid = message.from_user.id
 
     if uid not in ADMINS:
@@ -612,7 +567,6 @@ async def checkprofile(message: Message):
 
     if reply and reply.from_user:
         target = reply.from_user.id
-        # Фикс: реплай на своё сообщение → показывался профиль админа
         if target == uid:
             return await message.answer("⚠️ Это твоё собственное сообщение. Укажи другого пользователя.")
     else:
@@ -621,30 +575,26 @@ async def checkprofile(message: Message):
         target = await get_user_id(parts[1])
         if target is None:
             return await message.answer("❌ Пользователь не найден")
-        # Фикс: нельзя проверить самого себя через @username тоже
         if target == uid:
             return await message.answer("⚠️ Это твой собственный профиль. Используй /profile.")
 
     await ensure_user(target)
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT nickname, balance, bank FROM users WHERE user_id = ?", (target,)
-        ) as cur:
-            row = await cur.fetchone()
-
-        async with db.execute("""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT nickname, balance, bank FROM users WHERE user_id = $1", target
+        )
+        tx_rows = await conn.fetch("""
             SELECT type, from_user, to_user, amount, created_at
             FROM transactions
-            WHERE from_user = ? OR to_user = ?
+            WHERE from_user = $1 OR to_user = $1
             ORDER BY id DESC
             LIMIT 5
-        """, (target, target)) as cur:
-            tx_rows = await cur.fetchall()
+        """, target)
 
-    nick = row[0] if row and row[0] else "No name"
-    bal = row[1] if row else 0
-    bank = row[2] if row else 0
+    nick = row["nickname"] if row and row["nickname"] else "No name"
+    bal = row["balance"] if row else 0
+    bank = row["bank"] if row else 0
 
     icons = {"PAY": "💸", "ADD": "➕", "TAKE": "➖", "WITHDRAW": "🏧", "DEPOSIT": "🏦", "BANKWITHDRAW": "🏦"}
 
@@ -659,7 +609,11 @@ async def checkprofile(message: Message):
     if tx_rows:
         text += "\n📋 <b>Последние транзакции:</b>\n"
         for r in tx_rows:
-            type_, from_u, to_u, amount, created_at = r
+            type_ = r["type"]
+            from_u = r["from_user"]
+            to_u = r["to_user"]
+            amount = r["amount"]
+            created_at = r["created_at"]
             icon = icons.get(type_, "🔄")
             to_str = f"→ <code>{to_u}</code>" if to_u else ""
             text += f"{icon} <b>{type_}</b> | <code>{from_u}</code> {to_str} | <b>{amount:.2f}$</b> | {created_at}\n"
@@ -673,7 +627,6 @@ async def checkprofile(message: Message):
 @dp.message(Command("resetallbalances_x7k2m"))
 async def reset_all_balances(message: Message):
     await save_user(message)
-
     uid = message.from_user.id
 
     if uid not in ADMINS:
@@ -690,15 +643,12 @@ async def reset_all_balances(message: Message):
             "<code>/resetallbalances_x7k2m CONFIRM</code>"
         )
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
+    async with pool.acquire() as conn:
+        count = await conn.fetchval(
             "SELECT COUNT(*) FROM users WHERE balance > 0 OR bank > 0"
-        ) as cur:
-            count = (await cur.fetchone())[0]
-
-        await db.execute("UPDATE users SET balance = 0, bank = 0")
-        await log_transaction(db, "RESET_ALL", from_user=uid, to_user=None, amount=0)
-        await db.commit()
+        )
+        await conn.execute("UPDATE users SET balance = 0, bank = 0")
+        await log_transaction(conn, "RESET_ALL", from_user=uid, to_user=None, amount=0)
 
     logger.warning(f"🔴 RESET ALL BALANCES — admin={uid}, affected={count} users")
     await message.answer(
