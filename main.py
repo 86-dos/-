@@ -20,6 +20,8 @@ from aiogram.exceptions import TelegramNetworkError
 API_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+logger.info(f"DB = {DATABASE_URL}")
+
 if not API_TOKEN:
     raise ValueError("❌ BOT_TOKEN not found in Secrets")
 if not DATABASE_URL:
