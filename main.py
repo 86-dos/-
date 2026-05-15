@@ -560,6 +560,10 @@ async def checkprofile(message: Message):
     await save_user(message)
     uid = message.from_user.id
 
+    # ❌ запрет в группах
+    if message.chat.type != "private":
+        return await message.answer("🔒 Эта команда доступна только в личных сообщениях")
+
     if uid not in ADMINS:
         logger.warning(f"🚫 /checkprofile — unauthorized user={uid}")
         return
