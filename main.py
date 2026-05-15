@@ -612,12 +612,18 @@ async def checkprofile(message: Message):
 
     if reply and reply.from_user:
         target = reply.from_user.id
+        # Фикс: реплай на своё сообщение → показывался профиль админа
+        if target == uid:
+            return await message.answer("⚠️ Это твоё собственное сообщение. Укажи другого пользователя.")
     else:
         if len(parts) < 2:
             return await message.answer("⚠️ Использование: /checkprofile @user\nИли ответь на сообщение игрока: /checkprofile")
         target = await get_user_id(parts[1])
         if target is None:
             return await message.answer("❌ Пользователь не найден")
+        # Фикс: нельзя проверить самого себя через @username тоже
+        if target == uid:
+            return await message.answer("⚠️ Это твой собственный профиль. Используй /profile.")
 
     await ensure_user(target)
 
